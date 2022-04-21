@@ -1,0 +1,266 @@
+---
+title: The Bayesian Model using CO2 data
+output:
+  pdf_document:
+    toc: true
+    toc_depth: 4
+---
+
+# Setup
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r load libraries, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(infer)
+library(broom)
+library(rstan)
+library(rstantools)
+library(cowplot)
+rstan_options(auto_write = TRUE)  # To save some compiling
+```
+
+# Atmospheric Carbon Dioxide
+
+The data is sourced from the Mauna Loa Observatory in Hawaii, USA. The data contains a measurement of the carbon dioxide in the atmosphere from 3400 meters recorded over a period of about 45 years. The data set can be found [here](https://gml.noaa.gov/ccgg/trends/data.html).
+
+## Load and Inspect the Data
+
+```{r}
+CO2_data <- read_table("data/co2_weekly_mlo.txt",comment="#", col_names=TRUE)
+
+CO2_data <- CO2_data |>
+  filter(ppm >= 0) |>
+  select(decimal, ppm)
+
+head(CO2_data)
+```
+
+```{r fig.width=11, fig.height=7}
+ppm_year_plot <- ggplot(CO2_data, aes(x=decimal, y=ppm)) +
+  geom_line() +
+  xlab("Year") +
+  ylab("CO2 concentration") +
+  ggtitle("CO2 concentration vs Year")
+
+ppm_year_plot
+```
+
+CO2 concentration is very clearly increasing over time, showing a visible increasing trend with fairly constant seasonality.
+
+## Modelling the Data
+
+We will use a Bayesian statistical model for this data. The model includes 3 parameters:
+
+-   A parameter $a$ to encode the slope of the function.
+-   A parameter $b$ to learn the vertical intercept of the function.
+-   A parameter $c$ to encode the acceleration of $\text{CO}_2$ concentration.
+
+And data:
+
+-   $x_i$ is the date (`decimal`) for measurement $i$.
+-   $Y_i \geq 0$ encodes the $\text{CO}_2$ concentration (`ppm`) for measurement $i$.
+
+## Likelihood
+
+Each measurement $Y_i$ will be assumed as independent and normally-distributed with variance $\sigma^2 = 1$ and mean $\mu_i$ that is a quadratic function:
+
+$$Y_i \sim \mathcal{N}\big(\mu_i = a (x_i - 1974)+ c(x_i-1974)^2 + b, \sigma = 1\big)$$
+
+## The Prior
+
+The model parameters $a$, $b$, and $c$ will have the following prior distributions:
+
+-   $a \sim \mathcal{N}(0, \sigma_a^2 = 100)$ (since the $\text{CO}_2$ concentration could be flat, increasing, or decreasing, but we are not certain).
+-   $b \sim \mathcal{N}(300, \sigma_b^2 = 1000)$ (since we think the $\text{CO}_2$ concentration at year 1974 is roughly 300 ppm, but are quite uncertain).
+-   $c \sim \mathcal{N}(0, \sigma_c^2 = 1)$ (since we do not think $\text{CO}_2$ concentration is accelerating or decelerating too quickly).
+
+## Coding the Prior Model
+
+```{stan output.var='prior_CO2_stan_code'}
+parameters {
+  real a;
+  real b;
+  real c;
+}
+model {
+  a ~ normal(0,10);
+  b ~ normal(300,31.62);
+  c ~ normal(0,1);
+}
+```
+
+## Sample and Visualize the Prior
+
+```{r}
+prior_CO2_sampling <- sampling(
+  object = prior_CO2_stan_code,
+  chains = 1,
+  iter = 11000,
+  warmup = 1000,
+  thin = 10,
+  seed = 553
+)
+
+prior_CO2_sampling <- as.data.frame(prior_CO2_sampling)
+head(prior_CO2_sampling)
+```
+
+```{r fig.width=11, fig.height=7}
+hist_CO2_a_prior <- ggplot(prior_CO2_sampling) +
+  geom_histogram(aes(x=a)) +
+  ggtitle("Histogram of prior a")
+hist_CO2_b_prior <- ggplot(prior_CO2_sampling) +
+  geom_histogram(aes(x=b)) +
+  ggtitle("Histogram of prior b")
+hist_CO2_c_prior <- ggplot(prior_CO2_sampling) +
+  geom_histogram(aes(x=c)) +
+  ggtitle("Histogram of prior c")
+
+
+plot_grid(hist_CO2_a_prior, hist_CO2_b_prior, hist_CO2_c_prior)
+```
+
+### Plotting the Prior Distributions over Linear Fits
+
+```{r fig.width=11, fig.height=7, warning=FALSE}
+prior_ppm_year_plot <- ggplot(CO2_data, aes(x=decimal, y=ppm)) +
+  geom_line() +
+  xlab("Year") +
+  ylab("CO2 concentration") +
+  ggtitle("Prior sampled fit data")
+for (j in 1:500){
+  a <- as.numeric(prior_CO2_sampling[j, "a"])
+  b <- as.numeric(prior_CO2_sampling[j, "b"])
+  c <- as.numeric(prior_CO2_sampling[j, "c"])
+  ppm_sim <- data.frame(decimal = CO2_data$decimal) |>
+                       mutate(values = (a*(decimal-1974) + c*((decimal-1974)^2) + b))
+  prior_ppm_year_plot <- prior_ppm_year_plot +
+  geom_line(data = ppm_sim, aes(x=decimal,y=values),alpha=.1, color='darkgreen')
+
+}
+
+plot_grid(
+  hist_CO2_a_prior, hist_CO2_b_prior, 
+  hist_CO2_c_prior, prior_ppm_year_plot
+)
+```
+
+The priors encapsulate the distributions of a, b and c and clearly show how poor they fit the given data. I'll create the posterior next to show just how Bayes' theorem can create better fit data.
+
+## Sample and Visualize the Posterior
+
+### Adding in Given Data and Coding the Posterior
+
+```{stan output.var='posterior_CO2_stan_code'}
+data {
+int<lower=0> N;
+vector[N] decimal;
+vector[N] ppm;
+}
+parameters {
+  real a;
+  real b;
+  real c;
+}
+model {
+  a ~ normal(0,10);
+  b ~ normal(300,31.62);
+  c ~ normal(0,1);
+for (i in 1:N){
+  ppm[i] ~ normal(a*(decimal[i]-1974) + c*(square(decimal[i]-1974)) + b,1);
+  }
+}
+```
+
+### Sampling the Posterior
+
+```{r}
+posterior_CO2_sampling <- sampling(
+  object = posterior_CO2_stan_code,
+  data = list(
+    N=2364,
+    decimal = CO2_data$decimal,
+    ppm = CO2_data$ppm
+  ),
+  chains = 1,
+  iter = 11000,
+  warmup = 1000,
+  thin = 10,
+  seed = 553
+)
+
+posterior_CO2_sampling_df <- as.data.frame(posterior_CO2_sampling)
+head(posterior_CO2_sampling_df)
+```
+
+### Histograms of the Posterior Sampled Parameters
+
+```{r fig.width=11, fig.height=7}
+hist_CO2_a_posterior <- ggplot(posterior_CO2_sampling_df) +
+  geom_histogram(aes(x=a)) +
+  xlab("a") +
+  ylab("Count") +
+  ggtitle("Posterior distribution of sampled a values")
+hist_CO2_b_posterior <- ggplot(posterior_CO2_sampling_df) +
+  geom_histogram(aes(x=b)) +
+  xlab("b") +
+  ylab("Count") +
+  ggtitle("Posterior distribution of sampled b values")
+hist_CO2_c_posterior <- ggplot(posterior_CO2_sampling_df) +
+  geom_histogram(aes(x=c)) +
+  xlab("c") +
+  ylab("Count") +
+  ggtitle("Posterior distribution of sampled c values")
+
+plot_grid(hist_CO2_a_posterior, hist_CO2_b_posterior, hist_CO2_c_posterior)
+```
+
+Here we can see that the parameter value's variances are much smaller, which is due to the inclusion of the data in the Stan model. In the form of Bayes' rule, the prior (sampled data) has now been given new information (Mauna Loa data) which results in the updated posterior (to become the new prior).
+
+### Plotting the Posterior Distributions over Linear Fits
+
+```{r fig.width=11, fig.height=7, warning=FALSE}
+posterior_ppm_year_plot <- ppm_year_plot + ggtitle("Posterior fit sampled data vs. original")
+
+for (j in 1:1000){
+  a <- as.numeric(posterior_CO2_sampling_df[j, "a"])
+  b <- as.numeric(posterior_CO2_sampling_df[j, "b"])
+  c <- as.numeric(posterior_CO2_sampling_df[j, "c"])
+  ppm_sim_post <- data.frame(decimal = CO2_data$decimal) |>
+                       mutate(values = (a*(decimal-1974) + c*((decimal-1974)^2) + b))
+  posterior_ppm_year_plot <- posterior_ppm_year_plot +
+  geom_line(data = ppm_sim_post, aes(x=decimal,y=values),alpha=.1, color='darkgreen')
+                       
+}
+
+plot_grid(
+  hist_CO2_a_posterior, hist_CO2_b_posterior, 
+  hist_CO2_c_posterior, posterior_ppm_year_plot
+)
+```
+
+What a difference! As mentioned before, the a, b and c posterior distributions have much lower variance than the priors, which indicates that the Stan model has found a fairly specific value for these parameters. The distribution over linear fits are significantly better as well, where now there are no outlying regressions. For our given time range, I can say that this model fits the data quite well and could even be used to make future predictions.
+
+## Posterior Point Estimates with 90% Credible Intervals
+
+```{r}
+tibble(variable = c("a", "b", "c"),
+       means = c(mean(posterior_CO2_sampling_df$a),
+                 mean(posterior_CO2_sampling_df$b),
+                 mean(posterior_CO2_sampling_df$c)),
+       median = c(median(posterior_CO2_sampling_df$a),
+                  median(posterior_CO2_sampling_df$b),
+                  median(posterior_CO2_sampling_df$c)),
+      ci_90_lower = c(quantile(posterior_CO2_sampling_df$a, probs=c(.05,.95))[1],
+                quantile(posterior_CO2_sampling_df$b, probs=c(.05,.95))[1],
+                quantile(posterior_CO2_sampling_df$c, probs=c(.05,.95))[1]),
+      ci_90_higher = c(quantile(posterior_CO2_sampling_df$a, probs=c(.05,.95))[2],
+                quantile(posterior_CO2_sampling_df$b, probs=c(.05,.95))[2],
+                quantile(posterior_CO2_sampling_df$c, probs=c(.05,.95))[2]))
+
+```
+
+The quantile interval width are very small, with the lower and upper bounds being within 3% of the mean value. This indicates that our data is consistent and that the model for the given parameters is statistically viable for these ranges.
